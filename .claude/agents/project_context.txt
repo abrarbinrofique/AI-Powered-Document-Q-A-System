@@ -465,10 +465,11 @@ export default function App() {
 ```bash
 # .env file
 DB_PASSWORD=your_secure_password_here
-FERNET_KEY=a0H07YOiGE6x2hC4sBYOlsG6BosGxDDMhmXMBegXp_g=
+FERNET_KEY=your_generated_fernet_key_here
 
 # Generate Fernet encryption key:
 # python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Use the generated key above (each deployment should have unique key)
 
 # NOTE: User OpenAI API keys are stored encrypted in database
 # Users enter their own keys through the UI - NOT in environment variables

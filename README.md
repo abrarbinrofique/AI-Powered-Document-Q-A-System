@@ -107,7 +107,7 @@ python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().
 
 **Copy the output** - you'll need it in the next step.
 
-Example output: `a0H07YOiGE6x2hC4sBYOlsG6BosGxDDMhmXMBegXp_g=`
+Example output format: `xXxXxXxXxXxXxXxXxXxXxXxXxXxXxXxXxXxXxXxX=` (your key will be different)
 
 ---
 
@@ -128,12 +128,12 @@ nano .env
 Replace these two values:
 
 ```env
-DB_PASSWORD=YourSecurePassword123!
-FERNET_KEY=a0H07YOiGE6x2hC4sBYOlsG6BosGxDDMhmXMBegXp_g=
+DB_PASSWORD=your_secure_password_here
+FERNET_KEY=paste_the_generated_key_from_step_2_here
 ```
 
-- `DB_PASSWORD`: Any strong password you want (for PostgreSQL)
-- `FERNET_KEY`: Paste the key from Step 2
+- `DB_PASSWORD`: Any strong password you want (16+ characters, mix of letters, numbers, symbols)
+- `FERNET_KEY`: Paste the key you generated in Step 2
 
 Save and exit (`Ctrl+X`, then `Y`, then `Enter` in nano).
 

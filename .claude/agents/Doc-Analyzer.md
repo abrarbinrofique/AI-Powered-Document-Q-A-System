@@ -1925,8 +1925,8 @@ FERNET_KEY=your_fernet_key_here
 # Run this to generate encryption key
 python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 
-# Example output: a0H07YOiGE6x2hC4sBYOlsG6BosGxDDMhmXMBegXp_g=
-# Add this to .env as FERNET_KEY
+# Example output format: xXxXxXxXxXxXxXxXxXxXxXxXxXxXxXxXxXxXxXxX=
+# Add this to .env as FERNET_KEY (use your generated key, not this example)
 ```
 
 ---
