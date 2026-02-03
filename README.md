@@ -89,7 +89,7 @@ You only need these installed:
 
 ```bash
 # If using Git
-git clone <your-repo-url>
+git clone https://github.com/abrarbinrofique/AI-Powered-Document-Q-A-System.git
 cd "Doc Analyzer"
 
 # Or if you have a ZIP file, extract it and cd into it
