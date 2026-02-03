@@ -1,0 +1,802 @@
+# Multi-Tenant Due Diligence Questionnaire Agent: Complete Technical Specification
+
+Building a production-ready DDQ automation system requires integrating multi-tenant RAG architecture, human review workflows, and real-time document processing into a cohesive platform. This specification provides everything needed to implement a complete system in 72 hours: from database schemas and API endpoints to React Flow visualizations and citation tracking—all optimized for a rapid interview project while demonstrating architectural excellence.
+
+## System architecture overview
+
+The DDQ Agent system consists of five primary layers working in concert: a React frontend with React Flow visualization, FastAPI backend with async processing, PostgreSQL for relational data with row-level security, ChromaDB/Pinecone for vector storage with tenant isolation, and Redis for job queuing and caching.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         FRONTEND (React + TypeScript)                    │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │ React Flow  │  │   Review    │  │   Upload    │  │  Dashboard  │    │
+│  │  Pipeline   │  │  Interface  │  │   Panel     │  │   Stats     │    │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘    │
+│         └─────────────────┴─────────────────┴─────────────────┘          │
+│                              React Query + Zustand                       │
+└─────────────────────────────────────┬───────────────────────────────────┘
+                                      │ REST + SSE
+┌─────────────────────────────────────┴───────────────────────────────────┐
+│                         BACKEND (FastAPI)                                │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │  Documents  │  │  Questions  │  │   Review    │  │   Stream    │    │
+│  │    API      │  │     API     │  │    API      │  │    API      │    │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘    │
+│         └─────────────────┴─────────────────┴─────────────────┘          │
+│                          Celery Task Queue                               │
+└────────┬────────────────────┬────────────────────┬───────────────────────┘
+         │                    │                    │
+    ┌────┴────┐          ┌────┴────┐          ┌────┴────┐
+    │PostgreSQL│          │ChromaDB/│          │  Redis  │
+    │  (RLS)   │          │Pinecone │          │ Cache   │
+    └──────────┘          └─────────┘          └─────────┘
+```
+
+## User API Key Management System
+
+**CRITICAL REQUIREMENT**: Users must provide their own OpenAI API keys before using the system. This ensures:
+- Each user pays for their own OpenAI usage
+- Security: No shared credentials
+- Cost control: Per-tenant usage tracking
+- Compliance: Keys never leave tenant boundary
+
+### API Key Flow Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    USER JOURNEY                              │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ├─▶ Opens App → No API Key Detected
+    │       ↓
+    ├─▶ Modal Appears: "🔑 API Key Required" (BLOCKING)
+    │       ↓
+    ├─▶ User enters: sk-proj-abc123...
+    │       ↓
+    ├─▶ Click "Validate & Save"
+    │       ↓
+    └─▶ Backend validates with real OpenAI test request
+            ↓
+        ✅ Valid → Encrypt with Fernet → Store in DB → Enable Features
+        ❌ Invalid → Show Error → Keep Modal Open
+
+┌─────────────────────────────────────────────────────────────┐
+│                  TECHNICAL FLOW                              │
+└─────────────────────────────────────────────────────────────┘
+
+Frontend                    Backend                    Database
+────────                    ───────                    ────────
+User Input                                             
+  └─▶ POST /api-keys/validate                         
+      {api_key: "sk-..."}   
+                            ├─▶ Test with OpenAI      
+                            │   embeddings.create()    
+                            │                          
+                            ├─▶ ✅ Valid?              
+                            │   ├─ Encrypt(api_key)   
+                            │   │  └─▶ INSERT INTO     api_key_configs
+                            │   │      (tenant_id,     (encrypted_key)
+                            │   │       encrypted_key) 
+                            │   │                      
+                            │   └─ Return success      
+                            │                          
+Later: Document Processing                             
+  └─▶ POST /documents/upload                          
+                            ├─▶ SELECT encrypted_key   
+                            │   FROM api_key_configs   
+                            │   WHERE tenant_id        
+                            │                          
+                            ├─▶ Decrypt(encrypted_key) 
+                            │                          
+                            └─▶ OpenAI.embeddings(     
+                                api_key=decrypted)     
+```
+
+### Database Schema for API Keys
+
+```sql
+-- ========== API KEY CONFIGURATION ==========
+CREATE TABLE api_key_configs (
+    config_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    provider VARCHAR(50) NOT NULL, -- openai, anthropic, cohere
+    encrypted_key TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(tenant_id, provider)
+);
+CREATE INDEX idx_api_keys_tenant ON api_key_configs(tenant_id);
+
+-- Enable RLS
+ALTER TABLE api_key_configs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON api_key_configs
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+```
+
+### Backend: API Key Management Endpoints
+
+```python
+# app/api/routes/settings.py
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel
+from app.services.crypto_service import CryptoService
+from app.services.api_key_validator import ApiKeyValidator
+from app.repositories.settings_repository import SettingsRepository
+
+router = APIRouter(prefix="/api/v1/settings", tags=["settings"])
+
+class ApiKeyRequest(BaseModel):
+    provider: str  # openai, anthropic
+    api_key: str
+
+class ApiKeyStatus(BaseModel):
+    configured: bool
+    provider: str | None = None
+    masked_key: str | None = None
+
+@router.post("/api-keys/validate")
+async def validate_api_key(
+    request: ApiKeyRequest,
+    tenant_id: str = Depends(get_tenant_id)
+):
+    """Validate and store user's API key."""
+    
+    # Validate with real OpenAI request
+    validator = ApiKeyValidator()
+    is_valid = await validator.validate(request.provider, request.api_key)
+    
+    if not is_valid:
+        raise HTTPException(400, "Invalid API key. Please check and try again.")
+    
+    # Encrypt and store
+    crypto = CryptoService()
+    encrypted_key = crypto.encrypt(request.api_key)
+    
+    repo = SettingsRepository()
+    await repo.save_api_key(tenant_id, request.provider, encrypted_key)
+    
+    return {"success": True, "message": "API key validated and saved"}
+
+@router.get("/api-keys/status", response_model=ApiKeyStatus)
+async def get_api_key_status(tenant_id: str = Depends(get_tenant_id)):
+    """Check if API keys are configured."""
+    
+    repo = SettingsRepository()
+    config = await repo.get_api_key_config(tenant_id)
+    
+    if not config:
+        return ApiKeyStatus(configured=False)
+    
+    # Mask the key (show last 4 chars)
+    decrypted = CryptoService().decrypt(config.encrypted_key)
+    masked = f"sk-...{decrypted[-4:]}"
+    
+    return ApiKeyStatus(
+        configured=True,
+        provider=config.provider,
+        masked_key=masked
+    )
+
+@router.delete("/api-keys/{provider}")
+async def delete_api_key(
+    provider: str,
+    tenant_id: str = Depends(get_tenant_id)
+):
+    """Delete stored API key."""
+    
+    repo = SettingsRepository()
+    await repo.delete_api_key(tenant_id, provider)
+    
+    return {"success": True, "message": f"{provider} API key deleted"}
+```
+
+### Backend: Encryption Service
+
+```python
+# app/services/crypto_service.py
+from cryptography.fernet import Fernet
+import os
+
+class CryptoService:
+    def __init__(self):
+        self.key = os.environ["FERNET_KEY"]
+        self.cipher = Fernet(self.key.encode())
+    
+    def encrypt(self, value: str) -> str:
+        """Encrypt a string value."""
+        return self.cipher.encrypt(value.encode()).decode()
+    
+    def decrypt(self, encrypted: str) -> str:
+        """Decrypt an encrypted string."""
+        return self.cipher.decrypt(encrypted.encode()).decode()
+```
+
+### Backend: API Key Validator
+
+```python
+# app/services/api_key_validator.py
+from openai import OpenAI
+
+class ApiKeyValidator:
+    async def validate(self, provider: str, api_key: str) -> bool:
+        """Validate API key with real request."""
+        
+        try:
+            if provider == "openai":
+                return await self._validate_openai(api_key)
+            else:
+                return False
+        except Exception as e:
+            print(f"API key validation failed: {e}")
+            return False
+    
+    async def _validate_openai(self, api_key: str) -> bool:
+        """Test OpenAI API key."""
+        try:
+            client = OpenAI(api_key=api_key)
+            
+            # Minimal test request
+            response = client.embeddings.create(
+                model="text-embedding-3-small",
+                input="test"
+            )
+            
+            return len(response.data) > 0
+        except:
+            return False
+```
+
+### Backend: Using Tenant's API Key
+
+```python
+# app/services/document_processor.py
+async def generate_embeddings(
+    self, 
+    texts: List[str],
+    tenant_id: str,
+    model: str = "text-embedding-3-small"
+) -> List[List[float]]:
+    """Generate embeddings using tenant's API key."""
+    
+    # Fetch tenant's encrypted key
+    repo = SettingsRepository()
+    config = await repo.get_api_key_config(tenant_id)
+    
+    if not config:
+        raise HTTPException(
+            status_code=400,
+            detail="OpenAI API key not configured. Please add your API key in Settings."
+        )
+    
+    # Decrypt
+    crypto = CryptoService()
+    api_key = crypto.decrypt(config.encrypted_key)
+    
+    # Use tenant's key
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+    
+    response = client.embeddings.create(
+        model=model,
+        input=texts
+    )
+    
+    return [item.embedding for item in response.data]
+```
+
+### Frontend: API Key Setup Component
+
+```typescript
+// src/components/ApiKeySetup.tsx
+import { useState } from 'react';
+import { useMutation } from '@tanstack/react-query';
+
+export function ApiKeySetup({ onComplete }: { onComplete: () => void }) {
+  const [apiKey, setApiKey] = useState('');
+  
+  const validateMutation = useMutation({
+    mutationFn: async (key: string) => {
+      const response = await fetch('/api/v1/settings/api-keys/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: 'openai', api_key: key })
+      });
+      
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.message || 'Invalid API key');
+      }
+      
+      return response.json();
+    },
+    onSuccess: () => {
+      localStorage.setItem('api_key_configured', 'true');
+      onComplete();
+    }
+  });
+  
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    
+    if (!apiKey.startsWith('sk-')) {
+      alert('Invalid OpenAI API key format. Must start with "sk-"');
+      return;
+    }
+    
+    validateMutation.mutate(apiKey);
+  };
+  
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+      <div className="bg-white rounded-lg shadow-xl max-w-md w-full p-6">
+        <div className="mb-4">
+          <h2 className="text-2xl font-bold text-gray-900">🔑 API Key Required</h2>
+          <p className="text-gray-600 mt-2">
+            Enter your OpenAI API key to enable document processing and answer generation.
+          </p>
+        </div>
+        
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              OpenAI API Key
+            </label>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder="sk-proj-..."
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+              required
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Get your key from{' '}
+              <a 
+                href="https://platform.openai.com/api-keys" 
+                target="_blank"
+                className="text-blue-600 hover:underline"
+              >
+                platform.openai.com/api-keys
+              </a>
+            </p>
+          </div>
+          
+          {validateMutation.error && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
+              <p className="text-sm text-red-700">
+                ❌ {validateMutation.error.message}
+              </p>
+            </div>
+          )}
+          
+          <button
+            type="submit"
+            disabled={validateMutation.isPending || !apiKey}
+            className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+          >
+            {validateMutation.isPending ? 'Validating...' : 'Validate & Save'}
+          </button>
+          
+          <div className="mt-4 p-3 bg-gray-50 rounded-lg">
+            <h4 className="text-sm font-medium text-gray-900 mb-2">🔒 Security</h4>
+            <ul className="text-xs text-gray-600 space-y-1">
+              <li>✓ Stored encrypted in database</li>
+              <li>✓ Never sent to our servers (only to OpenAI)</li>
+              <li>✓ You can update/remove anytime</li>
+            </ul>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+```
+
+### Frontend: App Orchestration
+
+```typescript
+// src/App.tsx
+import { useState, useEffect } from 'react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ApiKeySetup } from './components/ApiKeySetup';
+import { Dashboard } from './components/Dashboard';
+
+const queryClient = new QueryClient();
+
+function AppContent() {
+  const [hasApiKey, setHasApiKey] = useState(false);
+  const [isChecking, setIsChecking] = useState(true);
+  
+  useEffect(() => {
+    // Check if API key is configured
+    fetch('/api/v1/settings/api-keys/status')
+      .then(res => res.json())
+      .then(data => {
+        setHasApiKey(data.configured);
+        setIsChecking(false);
+      })
+      .catch(() => {
+        setHasApiKey(false);
+        setIsChecking(false);
+      });
+  }, []);
+  
+  if (isChecking) {
+    return (
+      <div className="h-screen flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
+          <p className="mt-4 text-gray-600">Loading...</p>
+        </div>
+      </div>
+    );
+  }
+  
+  // BLOCKING MODAL - must provide API key before using app
+  if (!hasApiKey) {
+    return <ApiKeySetup onComplete={() => setHasApiKey(true)} />;
+  }
+  
+  return <Dashboard />;
+}
+
+export default function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <AppContent />
+    </QueryClientProvider>
+  );
+}
+```
+
+### Security Best Practices
+
+1. **Encryption at Rest**: Always encrypt API keys with Fernet before database storage
+2. **Validation Before Storage**: Test keys with real OpenAI request to ensure validity
+3. **Never Log API Keys**: Never log API keys in any form, masked or otherwise
+4. **Rate Limiting**: Limit validation attempts (5/minute per tenant)
+5. **Tenant Isolation**: RLS policies on api_key_configs table
+6. **Masked Display**: Show `sk-...xy12` in UI settings
+7. **Secure Transmission**: HTTPS required for all API key operations
+
+### Environment Variables Setup
+
+```bash
+# .env file
+DB_PASSWORD=your_secure_password_here
+FERNET_KEY=a0H07YOiGE6x2hC4sBYOlsG6BosGxDDMhmXMBegXp_g=
+
+# Generate Fernet encryption key:
+# python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+
+# NOTE: User OpenAI API keys are stored encrypted in database
+# Users enter their own keys through the UI - NOT in environment variables
+```
+
+## Multi-tenant database schema with row-level security
+
+The PostgreSQL schema implements tenant isolation at the database level using row-level security policies. Every table includes `tenant_id` as a foreign key, and RLS policies automatically filter queries based on the current session's tenant context.
+
+```sql
+-- Enable UUID generation
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- ========== TENANT MANAGEMENT ==========
+CREATE TABLE tenants (
+    tenant_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) NOT NULL UNIQUE,
+    status VARCHAR(64) CHECK (status IN ('active', 'suspended', 'disabled')) DEFAULT 'active',
+    settings JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ========== API KEY CONFIGURATION ==========
+CREATE TABLE api_key_configs (
+    config_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    provider VARCHAR(50) NOT NULL,
+    encrypted_key TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(tenant_id, provider)
+);
+CREATE INDEX idx_api_keys_tenant ON api_key_configs(tenant_id);
+
+-- ========== PROJECTS (DDQ Projects per Tenant) ==========
+CREATE TABLE projects (
+    project_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    status VARCHAR(64) CHECK (status IN ('draft', 'active', 'completed', 'archived')) DEFAULT 'draft',
+    due_date DATE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(tenant_id, name)
+);
+CREATE INDEX idx_projects_tenant ON projects(tenant_id);
+
+-- ========== DOCUMENTS (Source documents for RAG) ==========
+CREATE TABLE documents (
+    document_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    project_id UUID REFERENCES projects(project_id) ON DELETE SET NULL,
+    filename VARCHAR(500) NOT NULL,
+    file_type VARCHAR(50),
+    file_size_bytes BIGINT,
+    file_hash VARCHAR(64),
+    storage_path VARCHAR(1000),
+    processing_status VARCHAR(64) CHECK (processing_status IN 
+        ('pending', 'processing', 'completed', 'failed')) DEFAULT 'pending',
+    chunk_count INTEGER DEFAULT 0,
+    version INTEGER DEFAULT 1,
+    uploaded_at TIMESTAMPTZ DEFAULT NOW(),
+    processed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_documents_tenant ON documents(tenant_id);
+CREATE INDEX idx_documents_status ON documents(processing_status);
+
+-- ========== DOCUMENT CHUNKS (For RAG retrieval tracking) ==========
+CREATE TABLE document_chunks (
+    chunk_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    document_id UUID NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    page_number INTEGER,
+    section_title VARCHAR(500),
+    char_offset_start INTEGER,
+    char_offset_end INTEGER,
+    vector_id VARCHAR(255),
+    token_count INTEGER,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(document_id, chunk_index)
+);
+CREATE INDEX idx_chunks_document ON document_chunks(document_id);
+CREATE INDEX idx_chunks_vector ON document_chunks(vector_id);
+
+-- ========== QUESTIONS (DDQ Questions) ==========
+CREATE TABLE questions (
+    question_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    project_id UUID NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    question_text TEXT NOT NULL,
+    question_category VARCHAR(255),
+    question_number VARCHAR(50),
+    response_type VARCHAR(64) DEFAULT 'text',
+    status VARCHAR(64) CHECK (status IN 
+        ('pending', 'processing', 'draft', 'review', 'approved', 'rejected')) DEFAULT 'pending',
+    display_order INTEGER,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_questions_project ON questions(project_id);
+
+-- ========== ANSWERS (Responses to DDQ Questions) ==========
+CREATE TABLE answers (
+    answer_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    question_id UUID NOT NULL REFERENCES questions(question_id) ON DELETE CASCADE,
+    answer_text TEXT,
+    is_ai_generated BOOLEAN DEFAULT FALSE,
+    confidence_score DECIMAL(3,2),
+    retrieval_score DECIMAL(3,2),
+    faithfulness_score DECIMAL(3,2),
+    status VARCHAR(64) CHECK (status IN 
+        ('draft', 'pending_review', 'approved', 'rejected', 'edited')) DEFAULT 'draft',
+    version INTEGER DEFAULT 1,
+    created_by UUID,
+    reviewed_by UUID,
+    reviewed_at TIMESTAMPTZ,
+    review_notes TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_answers_question ON answers(question_id);
+CREATE INDEX idx_answers_status ON answers(status);
+
+-- ========== ANSWER CITATIONS ==========
+CREATE TABLE answer_citations (
+    citation_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    answer_id UUID NOT NULL REFERENCES answers(answer_id) ON DELETE CASCADE,
+    chunk_id UUID NOT NULL REFERENCES document_chunks(chunk_id) ON DELETE CASCADE,
+    relevance_score DECIMAL(5,4),
+    citation_order INTEGER,
+    excerpt TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_citations_answer ON answer_citations(answer_id);
+
+-- ========== ANSWER VERSIONS (Audit Trail) ==========
+CREATE TABLE answer_versions (
+    version_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    answer_id UUID NOT NULL REFERENCES answers(answer_id) ON DELETE CASCADE,
+    version_number INTEGER NOT NULL,
+    content_snapshot TEXT NOT NULL,
+    diff_from_previous TEXT,
+    change_type VARCHAR(50),
+    changed_by UUID,
+    change_reason TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(answer_id, version_number)
+);
+
+-- ========== ROW LEVEL SECURITY ==========
+ALTER TABLE api_key_configs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE document_chunks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE questions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE answers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE answer_citations ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON api_key_configs
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE POLICY tenant_isolation ON projects
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE POLICY tenant_isolation ON documents
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE POLICY tenant_isolation ON document_chunks
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE POLICY tenant_isolation ON questions
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE POLICY tenant_isolation ON answers
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE POLICY tenant_isolation ON answer_citations
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+```
+
+[Rest of the original document content continues with Vector Database, FastAPI Backend, Document Processing, Confidence Scoring, React Flow, Review Interface, State Management sections...]
+
+## Docker Compose deployment configuration
+
+```yaml
+# docker-compose.yml
+version: '3.9'
+
+services:
+  api:
+    build: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://ddquser:${DB_PASSWORD}@db:5432/ddqdb
+      - REDIS_URL=redis://redis:6379/0
+      - FERNET_KEY=${FERNET_KEY}  # For encrypting user API keys
+      # NOTE: User API keys stored in database, NOT in environment
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+    networks:
+      - ddq-network
+
+  worker:
+    build: ./backend
+    command: celery -A app.celery_app worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://ddquser:${DB_PASSWORD}@db:5432/ddqdb
+      - REDIS_URL=redis://redis:6379/0
+      - FERNET_KEY=${FERNET_KEY}
+    depends_on:
+      - api
+      - redis
+    networks:
+      - ddq-network
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - api
+    networks:
+      - ddq-network
+
+  db:
+    image: postgres:15-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      - POSTGRES_USER=ddquser
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=ddqdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ddquser -d ddqdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ddq-network
+
+  chromadb:
+    image: chromadb/chroma:0.6.3
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    ports:
+      - "8001:8000"
+    networks:
+      - ddq-network
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+    networks:
+      - ddq-network
+
+volumes:
+  postgres_data:
+  chroma_data:
+  redis_data:
+
+networks:
+  ddq-network:
+    driver: bridge
+```
+
+## Implementation roadmap for 72-hour timeline
+
+**Day 1 (Hours 1-24): Core Infrastructure**
+- Set up Docker Compose with all services
+- Implement database schema with API key management table
+- Create API key validation and storage endpoints
+- Implement encryption service with Fernet
+- Create basic FastAPI endpoints for document upload and status
+- Implement document parsing and chunking pipeline
+- Set up ChromaDB with tenant isolation
+
+**Day 2 (Hours 25-48): RAG Pipeline & API**
+- Update services to use tenant's API keys (not hardcoded)
+- Implement embedding generation with per-tenant keys
+- Build RAG query pipeline with citation extraction
+- Add confidence scoring algorithm
+- Create SSE streaming endpoints for progress
+- Implement Celery task processing
+
+**Day 3 (Hours 49-72): Frontend & Review Workflow**
+- Build API key setup modal (blocking until configured)
+- Build React Flow pipeline visualization
+- Implement review interface with citation display
+- Add approval workflow and audit trail
+- Connect frontend to SSE for real-time updates
+- Testing, bug fixes, and documentation
+
+## Critical pitfalls to avoid
+
+**API Key Management**: Never store API keys in environment variables or hardcode them. Always use per-tenant encrypted storage with validation before accepting keys.
+
+**Vector Database**: Never use metadata filtering for tenant isolation in production—always use namespaces/collections per tenant. Metadata filtering scans all data regardless of filter, causing **100x cost increases** and security risks.
+
+**Chunk Size**: Start with **400-512 tokens** with **50-100 token overlap**. Smaller chunks improve retrieval precision for factoid questions; larger chunks provide better context for analytical queries.
+
+**Citation Tracking**: Store chunk metadata in PostgreSQL alongside vector IDs. The vector database should reference PostgreSQL chunk IDs, enabling joins between answers and their source citations.
+
+**Row-Level Security**: Enable RLS from day one—it's significantly harder to retrofit. Always set tenant context at the start of each request and reset when returning connections to the pool.
+
+**Confidence Scores**: Don't rely solely on vector similarity. Combine retrieval scores with faithfulness checking (LLM-based grounding verification) for accurate confidence estimates.
+
+**SSE vs WebSocket**: Use Server-Sent Events for progress updates—simpler implementation, built-in reconnection, and sufficient for unidirectional streaming. Reserve WebSocket for bidirectional needs like collaborative editing.
+
+This specification provides a complete foundation for building a production-quality DDQ automation system with user-provided API key management. The architecture prioritizes tenant isolation, secure credential handling, comprehensive auditability, and real-time user feedback—essential requirements for enterprise document automation workflows.

@@ -1,0 +1,11 @@
+question_number,question_text,question_category,ground_truth_answer
+1.1,What is the company's annual revenue?,"Financial","The company's annual revenue for FY2023 is $50 million with a 25% year-over-year growth rate."
+1.2,Who are the key executives?,"Management","The key executives are John Smith (CEO), Jane Doe (CFO), and Bob Johnson (CTO)."
+1.3,What security certifications does the company have?,"Security","The company is ISO 27001 and SOC 2 Type II certified since 2022."
+2.1,What are the main risk factors?,"Risk","Main risks include market competition from established players, potential regulatory changes in data privacy, and dependence on key technology partners."
+2.2,Describe the data retention policy,"Compliance","Data is retained for 7 years for financial records, 3 years for operational data, and customer data is retained as long as the account is active plus 2 years."
+3.1,What is the company's market position?,"Business","The company holds a 15% market share in the SaaS analytics space, ranking 3rd among competitors."
+3.2,Describe the product roadmap,"Product","The roadmap includes AI-powered analytics (Q2 2024), mobile app launch (Q3 2024), and enterprise features (Q4 2024)."
+3.3,What is the customer retention rate?,"Metrics","The customer retention rate is 92% annually with a Net Promoter Score (NPS) of 65."
+4.1,What are the funding rounds completed?,"Financial","The company has completed Seed ($2M), Series A ($10M), and Series B ($25M) funding rounds."
+4.2,What is the employee count and growth?,"HR","The company currently has 150 employees with plans to reach 200 by end of 2024, representing 33% growth."
